@@ -2,9 +2,10 @@
 
 import json
 import os
+import re
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-from datetime import datetime
+from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime, timedelta
 import zoneinfo
 import time
 
@@ -97,7 +98,240 @@ class GranolaMCPServer:
         """Format datetime in local timezone for display."""
         local_dt = self._convert_to_local_time(utc_datetime)
         return local_dt.strftime('%Y-%m-%d %H:%M')
-    
+
+    def _parse_temporal_expressions(self, query: str) -> Tuple[Optional[datetime], Optional[datetime], bool]:
+        """Parse temporal expressions from search query.
+
+        Returns:
+            Tuple of (start_date, end_date, sort_by_date)
+            - start_date/end_date: datetime range to filter by (None if no date filter)
+            - sort_by_date: whether to sort results by date (True for temporal queries)
+        """
+        query_lower = query.lower()
+        now = datetime.now(self.local_timezone)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+        # Convert to UTC for consistent filtering
+        today_start_utc = today_start.astimezone(zoneinfo.ZoneInfo('UTC'))
+
+        # Check for "most recent" or "latest" expressions
+        if re.search(r'\b(most recent|latest|newest|recent)\b', query_lower):
+            return None, None, True  # No date filter, but sort by date
+
+        # Yesterday
+        if re.search(r'\byesterday\b', query_lower):
+            yesterday_start = today_start_utc - timedelta(days=1)
+            yesterday_end = today_start_utc - timedelta(seconds=1)
+            return yesterday_start, yesterday_end, True
+
+        # Today
+        if re.search(r'\btoday\b', query_lower):
+            today_end = today_start_utc + timedelta(days=1) - timedelta(seconds=1)
+            return today_start_utc, today_end, True
+
+        # This week (Monday to Sunday)
+        if re.search(r'\bthis week\b', query_lower):
+            days_since_monday = today_start.weekday()
+            week_start = (today_start - timedelta(days=days_since_monday)).astimezone(zoneinfo.ZoneInfo('UTC'))
+            week_end = week_start + timedelta(days=7) - timedelta(seconds=1)
+            return week_start, week_end, True
+
+        # Last week
+        if re.search(r'\blast week\b', query_lower):
+            days_since_monday = today_start.weekday()
+            this_week_start = today_start - timedelta(days=days_since_monday)
+            last_week_start = (this_week_start - timedelta(days=7)).astimezone(zoneinfo.ZoneInfo('UTC'))
+            last_week_end = this_week_start.astimezone(zoneinfo.ZoneInfo('UTC')) - timedelta(seconds=1)
+            return last_week_start, last_week_end, True
+
+        # This month
+        if re.search(r'\bthis month\b', query_lower):
+            month_start = today_start.replace(day=1).astimezone(zoneinfo.ZoneInfo('UTC'))
+            # Calculate next month start
+            if today_start.month == 12:
+                next_month_start = today_start.replace(year=today_start.year + 1, month=1, day=1)
+            else:
+                next_month_start = today_start.replace(month=today_start.month + 1, day=1)
+            month_end = next_month_start.astimezone(zoneinfo.ZoneInfo('UTC')) - timedelta(seconds=1)
+            return month_start, month_end, True
+
+        # Last month
+        if re.search(r'\blast month\b', query_lower):
+            # Calculate last month start
+            if today_start.month == 1:
+                last_month_start = today_start.replace(year=today_start.year - 1, month=12, day=1)
+            else:
+                last_month_start = today_start.replace(month=today_start.month - 1, day=1)
+
+            month_start = today_start.replace(day=1)
+            return (last_month_start.astimezone(zoneinfo.ZoneInfo('UTC')),
+                   month_start.astimezone(zoneinfo.ZoneInfo('UTC')) - timedelta(seconds=1),
+                   True)
+
+        # Try to find specific date patterns (YYYY-MM-DD, MM/DD/YYYY, etc.)
+        date_patterns = [
+            r'\b(\d{4}-\d{1,2}-\d{1,2})\b',  # YYYY-MM-DD
+            r'\b(\d{1,2}/\d{1,2}/\d{4})\b',  # MM/DD/YYYY
+            r'\b(\d{1,2}-\d{1,2}-\d{4})\b',  # MM-DD-YYYY
+        ]
+
+        for pattern in date_patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                date_str = match.group(1)
+                try:
+                    if '-' in date_str and len(date_str.split('-')[0]) == 4:  # YYYY-MM-DD
+                        parsed_date = datetime.strptime(date_str, '%Y-%m-%d')
+                    elif '/' in date_str:  # MM/DD/YYYY
+                        parsed_date = datetime.strptime(date_str, '%m/%d/%Y')
+                    else:  # MM-DD-YYYY
+                        parsed_date = datetime.strptime(date_str, '%m-%d-%Y')
+
+                    # Convert to local timezone then to UTC
+                    local_date = parsed_date.replace(tzinfo=self.local_timezone)
+                    date_start_utc = local_date.astimezone(zoneinfo.ZoneInfo('UTC'))
+                    date_end_utc = date_start_utc + timedelta(days=1) - timedelta(seconds=1)
+                    return date_start_utc, date_end_utc, True
+                except ValueError:
+                    continue  # Try next pattern
+
+        # Try to find month/day patterns (January 5, Dec 25, etc.)
+        current_year = now.year
+        month_day_patterns = [
+            # Full month names
+            r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?\b',
+            # Abbreviated month names
+            r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b',
+            # Numeric patterns MM/DD (assume current year)
+            r'\b(\d{1,2})/(\d{1,2})\b',
+            # "on [date]" patterns
+            r'\bon\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?\b',
+            r'\bon\s+(\d{1,2})/(\d{1,2})\b',
+        ]
+
+        month_map = {
+            'january': 1, 'jan': 1, 'february': 2, 'feb': 2, 'march': 3, 'mar': 3,
+            'april': 4, 'apr': 4, 'may': 5, 'june': 6, 'jun': 6,
+            'july': 7, 'jul': 7, 'august': 8, 'aug': 8, 'september': 9, 'sep': 9, 'sept': 9,
+            'october': 10, 'oct': 10, 'november': 11, 'nov': 11, 'december': 12, 'dec': 12
+        }
+
+        for pattern in month_day_patterns:
+            match = re.search(pattern, query_lower)
+            if match:
+                try:
+                    groups = match.groups()
+                    if len(groups) == 2:
+                        if groups[0].isdigit():  # MM/DD format
+                            month = int(groups[0])
+                            day = int(groups[1])
+                        else:  # Month name format
+                            month = month_map.get(groups[0].lower())
+                            day = int(groups[1])
+                            if month is None:
+                                continue
+
+                        # Create date for current year first
+                        try:
+                            parsed_date = datetime(current_year, month, day)
+                            local_date = parsed_date.replace(tzinfo=self.local_timezone)
+
+                            # If the date is more than 6 months in the future, assume it was last year
+                            # If the date is more than 6 months in the past, might be next year
+                            date_diff = local_date - now
+                            if date_diff.days > 180:
+                                # Try previous year
+                                parsed_date = datetime(current_year - 1, month, day)
+                                local_date = parsed_date.replace(tzinfo=self.local_timezone)
+                            elif date_diff.days < -180:
+                                # Try next year
+                                parsed_date = datetime(current_year + 1, month, day)
+                                local_date = parsed_date.replace(tzinfo=self.local_timezone)
+
+                            date_start_utc = local_date.astimezone(zoneinfo.ZoneInfo('UTC'))
+                            date_end_utc = date_start_utc + timedelta(days=1) - timedelta(seconds=1)
+                            return date_start_utc, date_end_utc, True
+
+                        except ValueError:
+                            continue  # Invalid date (e.g., Feb 30)
+
+                except (ValueError, IndexError):
+                    continue  # Try next pattern
+
+        # No temporal expressions found
+        return None, None, False
+
+    def _filter_meetings_by_date(self, meetings: List[MeetingMetadata], start_date: Optional[datetime], end_date: Optional[datetime]) -> List[MeetingMetadata]:
+        """Filter meetings by date range."""
+        if start_date is None and end_date is None:
+            return meetings
+
+        filtered_meetings = []
+        for meeting in meetings:
+            meeting_date = meeting.date
+            if start_date is not None and meeting_date < start_date:
+                continue
+            if end_date is not None and meeting_date > end_date:
+                continue
+            filtered_meetings.append(meeting)
+
+        return filtered_meetings
+
+    def _get_recent_meetings(self, meetings: List[MeetingMetadata], limit: int = 10) -> List[MeetingMetadata]:
+        """Get the most recent meetings sorted by date."""
+        sorted_meetings = sorted(meetings, key=lambda m: m.date, reverse=True)
+        return sorted_meetings[:limit]
+
+    def _clean_query_for_text_search(self, query: str) -> str:
+        """Remove temporal expressions from query to get clean text for searching."""
+        # Remove common temporal expressions that don't contribute to content search
+        temporal_patterns = [
+            r'\b(most recent|latest|newest|recent)\b',
+            r'\byesterday\'?s?\b',  # Handle possessive forms
+            r'\btoday\'?s?\b',
+            r'\bthis week\'?s?\b',
+            r'\blast week\'?s?\b',
+            r'\bthis month\'?s?\b',
+            r'\blast month\'?s?\b',
+            # Specific date patterns
+            r'\bfrom\s+(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/\d{4}|\d{1,2}-\d{1,2}-\d{4})\b',
+            r'\bon\s+(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/\d{4}|\d{1,2}-\d{1,2}-\d{4})\b',
+            # Month/day patterns
+            r'\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?\b',
+            r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b',
+            r'\bon\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?\b',
+            r'\bon\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b',
+            r'\bon\s+(\d{1,2})/(\d{1,2})\b',
+            # Remove standalone "on" when it precedes dates
+            r'\bon\s+(?=(january|february|march|april|may|june|july|august|september|october|november|december|\d{1,2}/\d{1,2}))',
+            # Standalone month/day numeric patterns (be careful not to match times)
+            r'\b(\d{1,2})/(\d{1,2})\b(?!\d)',  # MM/DD but not MM/DD/YY or times like 12/12:30
+        ]
+
+        cleaned_query = query
+        for pattern in temporal_patterns:
+            cleaned_query = re.sub(pattern, '', cleaned_query, flags=re.IGNORECASE)
+
+        # Clean up extra whitespace and apostrophes left behind
+        cleaned_query = re.sub(r'\s+', ' ', cleaned_query)  # Multiple spaces to single space
+        cleaned_query = re.sub(r"'\s*", ' ', cleaned_query)  # Orphaned apostrophes
+
+        # Remove common leftover words that don't contribute to search
+        leftover_patterns = [
+            r'\b(meetings?|meeting|on|from|at|in|the|a|an)\s*$',  # End of string
+            r'^\s*(meetings?|meeting|on|from|at|in|the|a|an)\b',  # Start of string
+            r'\bmeetings?\s+on\b',  # "meetings on"
+            r'\bmeetings?\s+from\b',  # "meetings from"
+        ]
+
+        for pattern in leftover_patterns:
+            cleaned_query = re.sub(pattern, '', cleaned_query, flags=re.IGNORECASE)
+
+        # Final whitespace cleanup
+        cleaned_query = re.sub(r'\s+', ' ', cleaned_query).strip()
+        return cleaned_query
+
     def _setup_handlers(self):
         """Set up MCP protocol handlers."""
         
@@ -107,18 +341,31 @@ class GranolaMCPServer:
             return [
                 Tool(
                     name="search_meetings",
-                    description="Search meetings by title, content, or participants",
+                    description="Search meetings by title, content, participants, and date ranges. Supports natural language date expressions like 'yesterday', 'this week', 'most recent', etc.",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "Search query for meetings"
+                                "description": "Search query for meetings. Can include temporal expressions like 'most recent', 'yesterday', 'this week'"
                             },
                             "limit": {
-                                "type": "integer", 
+                                "type": "integer",
                                 "description": "Maximum number of results",
                                 "default": 10
+                            },
+                            "sort_by_date": {
+                                "type": "boolean",
+                                "description": "Sort results by date instead of relevance (useful for temporal queries)",
+                                "default": False
+                            },
+                            "date_range": {
+                                "type": "object",
+                                "properties": {
+                                    "start_date": {"type": "string", "format": "date"},
+                                    "end_date": {"type": "string", "format": "date"}
+                                },
+                                "description": "Optional explicit date range for filtering meetings"
                             }
                         },
                         "required": ["query"]
@@ -199,7 +446,9 @@ class GranolaMCPServer:
             if name == "search_meetings":
                 return await self._search_meetings(
                     query=arguments["query"],
-                    limit=arguments.get("limit", 10)
+                    limit=arguments.get("limit", 10),
+                    sort_by_date=arguments.get("sort_by_date", False),
+                    date_range=arguments.get("date_range")
                 )
             elif name == "get_meeting_details":
                 return await self._get_meeting_details(arguments["meeting_id"])
@@ -462,51 +711,189 @@ class GranolaMCPServer:
         combined = '\n\n'.join(part.strip() for part in text_parts if isinstance(part, str) and part.strip())
         return combined.strip()
     
-    async def _search_meetings(self, query: str, limit: int = 10) -> List[TextContent]:
-        """Search meetings by query."""
+    async def _search_meetings(self, query: str, limit: int = 10, sort_by_date: bool = False, date_range: Optional[Dict] = None) -> List[TextContent]:
+        """Search meetings by query with date-aware functionality."""
         if not self.cache_data:
             return [TextContent(type="text", text="No meeting data available")]
-        
-        query_lower = query.lower()
-        results = []
-        
-        for meeting_id, meeting in self.cache_data.meetings.items():
-            score = 0
-            
-            # Search in title
-            if query_lower in meeting.title.lower():
-                score += 2
-            
-            # Search in participants
-            for participant in meeting.participants:
-                if query_lower in participant.lower():
-                    score += 1
-            
-            # Search in transcript content if available
-            if meeting_id in self.cache_data.transcripts:
-                transcript = self.cache_data.transcripts[meeting_id]
-                if query_lower in transcript.content.lower():
-                    score += 1
-            
-            if score > 0:
-                results.append((score, meeting))
-        
-        # Sort by relevance and limit results
-        results.sort(key=lambda x: x[0], reverse=True)
-        results = results[:limit]
-        
+
+        # Parse temporal expressions from the query
+        parsed_start_date, parsed_end_date, auto_sort_by_date = self._parse_temporal_expressions(query)
+
+        # Determine final date filtering and sorting behavior
+        # Our temporal expression parsing takes precedence over external date_range
+        # because we handle timezone calculations correctly
+        if parsed_start_date is not None or parsed_end_date is not None:
+            # Use our parsed dates - we calculated them correctly
+            start_date = parsed_start_date
+            end_date = parsed_end_date
+        elif date_range:
+            # Only use external date_range if we didn't parse any temporal expressions
+            if date_range.get("start_date"):
+                start_date = datetime.fromisoformat(date_range["start_date"]).replace(tzinfo=zoneinfo.ZoneInfo('UTC'))
+            else:
+                start_date = None
+
+            if date_range.get("end_date"):
+                end_date = datetime.fromisoformat(date_range["end_date"]).replace(tzinfo=zoneinfo.ZoneInfo('UTC'))
+            else:
+                end_date = None
+        else:
+            start_date = None
+            end_date = None
+
+        # Sort by date if explicitly requested or auto-detected from temporal query
+        should_sort_by_date = sort_by_date or auto_sort_by_date
+
+        # Get all meetings and apply date filtering
+        meetings = list(self.cache_data.meetings.values())
+        if start_date is not None or end_date is not None:
+            meetings = self._filter_meetings_by_date(meetings, start_date, end_date)
+
+        # Clean the query for text search (remove temporal expressions)
+        clean_query = self._clean_query_for_text_search(query)
+
+        # Determine query type
+        is_date_only_query = not clean_query.strip()
+        is_date_filtered_query = (start_date is not None or end_date is not None) and clean_query.strip()
+
+        if is_date_only_query:
+            # Pure date queries: "meetings from yesterday", "January 5", "most recent"
+            if should_sort_by_date:
+                # For "most recent" type queries, sort by date and return recent meetings
+                meetings = self._get_recent_meetings(meetings, limit)
+            else:
+                # For specific date ranges, just limit the results
+                meetings = meetings[:limit]
+
+            results = [(1, meeting) for meeting in meetings]  # Assign equal relevance
+
+        elif is_date_filtered_query:
+            # Mixed queries: "backlog meetings from yesterday", "standup on January 5"
+            # Search content within the date-filtered meetings
+            query_lower = clean_query.lower()
+            scored_results = []
+
+            for meeting in meetings:
+                score = 0
+
+                # Search in title
+                if query_lower in meeting.title.lower():
+                    score += 3  # Higher weight for title matches
+
+                # Search in participants
+                for participant in meeting.participants:
+                    if query_lower in participant.lower():
+                        score += 2
+
+                # Search in transcript content if available
+                meeting_id = meeting.id
+                if meeting_id in self.cache_data.transcripts:
+                    transcript = self.cache_data.transcripts[meeting_id]
+                    if query_lower in transcript.content.lower():
+                        score += 1
+
+                # Search in document content if available
+                if meeting_id in self.cache_data.documents:
+                    document = self.cache_data.documents[meeting_id]
+                    if query_lower in document.content.lower():
+                        score += 1
+
+                # Only include meetings that have content matches
+                if score > 0:
+                    scored_results.append((score, meeting))
+
+            # Sort by relevance, with date as secondary sort for ties
+            if should_sort_by_date:
+                scored_results.sort(key=lambda x: (x[0], x[1].date), reverse=True)
+            else:
+                scored_results.sort(key=lambda x: x[0], reverse=True)
+
+            results = scored_results[:limit]
+
+        else:
+            # Pure content queries: "backlog meetings", "standup with Alice"
+            # Search all meetings without date filtering
+            query_lower = clean_query.lower()
+            scored_results = []
+
+            for meeting in meetings:
+                score = 0
+
+                # Search in title
+                if query_lower in meeting.title.lower():
+                    score += 3
+
+                # Search in participants
+                for participant in meeting.participants:
+                    if query_lower in participant.lower():
+                        score += 2
+
+                # Search in transcript content if available
+                meeting_id = meeting.id
+                if meeting_id in self.cache_data.transcripts:
+                    transcript = self.cache_data.transcripts[meeting_id]
+                    if query_lower in transcript.content.lower():
+                        score += 1
+
+                # Search in document content if available
+                if meeting_id in self.cache_data.documents:
+                    document = self.cache_data.documents[meeting_id]
+                    if query_lower in document.content.lower():
+                        score += 1
+
+                if score > 0:
+                    scored_results.append((score, meeting))
+
+            # Sort by relevance or date
+            if should_sort_by_date:
+                scored_results.sort(key=lambda x: (x[1].date, x[0]), reverse=True)
+            else:
+                scored_results.sort(key=lambda x: x[0], reverse=True)
+
+            results = scored_results[:limit]
+
+        # Generate output
         if not results:
-            return [TextContent(type="text", text=f"No meetings found matching '{query}'")]
-        
-        output_lines = [f"Found {len(results)} meeting(s) matching '{query}':\n"]
-        
+            date_context = ""
+            if start_date or end_date:
+                if start_date and end_date:
+                    date_context = f" between {self._format_local_time(start_date)} and {self._format_local_time(end_date)}"
+                elif start_date:
+                    date_context = f" after {self._format_local_time(start_date)}"
+                elif end_date:
+                    date_context = f" before {self._format_local_time(end_date)}"
+
+            return [TextContent(type="text", text=f"No meetings found matching '{query}'{date_context}")]
+
+        # Prepare output based on query type
+        if not clean_query.strip() and should_sort_by_date:
+            output_lines = [f"Most recent meetings"]
+            if start_date or end_date:
+                if start_date and end_date:
+                    output_lines[0] += f" between {self._format_local_time(start_date)} and {self._format_local_time(end_date)}"
+                elif start_date:
+                    output_lines[0] += f" after {self._format_local_time(start_date)}"
+                elif end_date:
+                    output_lines[0] += f" before {self._format_local_time(end_date)}"
+            output_lines[0] += ":\n"
+        else:
+            output_lines = [f"Found {len(results)} meeting(s) matching '{query}'"]
+            if start_date or end_date:
+                if start_date and end_date:
+                    output_lines[0] += f" between {self._format_local_time(start_date)} and {self._format_local_time(end_date)}"
+                elif start_date:
+                    output_lines[0] += f" after {self._format_local_time(start_date)}"
+                elif end_date:
+                    output_lines[0] += f" before {self._format_local_time(end_date)}"
+            output_lines[0] += ":\n"
+
         for score, meeting in results:
             output_lines.append(f"• **{meeting.title}** ({meeting.id})")
             output_lines.append(f"  Date: {self._format_local_time(meeting.date)}")
             if meeting.participants:
                 output_lines.append(f"  Participants: {', '.join(meeting.participants)}")
             output_lines.append("")
-        
+
         return [TextContent(type="text", text="\n".join(output_lines))]
     
     async def _get_meeting_details(self, meeting_id: str) -> List[TextContent]:
